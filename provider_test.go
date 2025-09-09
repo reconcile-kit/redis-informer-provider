@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"testing"
 	"time"
@@ -15,7 +16,7 @@ func TestRedisStreamListener(t *testing.T) {
 
 	redisAddr := "localhost:6380"
 
-	/* ── 2. создаём listener ──────────────────────────────────────── */
+	/* ── 2. create listener ──────────────────────────────────────── */
 	lst, err := NewRedisStreamListener(redisAddr, "test")
 	if err != nil {
 		t.Fatalf("cannot create redis stream listener: %v", err)
@@ -26,7 +27,7 @@ func TestRedisStreamListener(t *testing.T) {
 		t.Fatalf("cannot clear queue: %v", err)
 	}
 
-	/* ── 3. канал, чтобы узнать, что handler отработал ────────────── */
+	/* ── 3. channel to know that handler has executed ────────────── */
 	done := make(chan struct{})
 
 	go func() {
@@ -37,7 +38,7 @@ func TestRedisStreamListener(t *testing.T) {
 			msgType string,
 			ack func(),
 		) {
-			// проверки полей
+			// field checks
 			if gk.Group != "core" || gk.Kind != "Widget" {
 				t.Errorf("unexpected kind %#v", gk)
 			}
@@ -50,12 +51,12 @@ func TestRedisStreamListener(t *testing.T) {
 
 			fmt.Println(gk.Kind)
 
-			ack()       // подтвердили
-			close(done) // сигнал тесту
+			ack()       // acknowledged
+			close(done) // signal to test
 		})
 	}()
 
-	/* ── 4. сериализуем событие прямо в Redis ─────────────────────── */
+	/* ── 4. serialize event directly to Redis ─────────────────────── */
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
 	if err := rdb.XAdd(context.Background(), &redis.XAddArgs{
 		Stream: lst.stream,
@@ -70,14 +71,14 @@ func TestRedisStreamListener(t *testing.T) {
 		t.Fatalf("XAdd failed: %v", err)
 	}
 
-	/* ── 5. ждём, чтобы handler отработал (max 2 сек) ─────────────── */
+	/* ── 5. wait for handler to execute (max 2 sec) ─────────────── */
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("handler was not called in time")
 	}
 
-	/* ── 6. убеждаемся, что pending-лист пуст после ack ───────────── */
+	/* ── 6. ensure pending list is empty after ack ───────────── */
 	p, err := rdb.XPendingExt(context.Background(), &redis.XPendingExtArgs{
 		Stream: lst.stream,
 		Group:  lst.group,
@@ -91,5 +92,96 @@ func TestRedisStreamListener(t *testing.T) {
 			fmt.Println(ext.Consumer)
 		}
 		t.Errorf("unexpected pending messages: %#v", p)
+	}
+}
+
+func TestRedisStreamListenerWithAuth(t *testing.T) {
+	redisAddr := "redis:6000"
+
+	// Test with authentication
+	config := &RedisConfig{
+		Addr:        redisAddr,
+		Username:    "default",
+		Password:    "password",
+		CertFile:    "/Users/new/redis_certs/cert.pem",
+		KeyFile:     "/Users/new/redis_certs/key",
+		DialTimeout: 30 * time.Second,
+	}
+
+	lst, err := NewRedisStreamListenerWithConfig(config, "test_auth")
+	if err != nil {
+		t.Fatalf("cannot create redis stream listener with auth: %v", err)
+	}
+
+	// Clear queue
+	err = lst.ClearQueue(context.Background())
+	if err != nil {
+		t.Fatalf("cannot clear queue: %v", err)
+	}
+
+	// Test message sending
+	done := make(chan struct{})
+
+	go func() {
+		lst.Listen(func(
+			ctx context.Context,
+			gk resource.GroupKind,
+			key resource.ObjectKey,
+			msgType string,
+			ack func(),
+		) {
+			if gk.Group != "core" || gk.Kind != "Widget" {
+				t.Errorf("unexpected kind %#v", gk)
+			}
+			if key.Namespace != "default" || key.Name != "demo" {
+				t.Errorf("unexpected key %#v", key)
+			}
+			if msgType != "update" {
+				t.Errorf("unexpected msgType %s", msgType)
+			}
+
+			ack()
+			close(done)
+		})
+	}()
+
+	var tlsConfig *tls.Config
+	if config.CertFile != "" && config.KeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(config.CertFile, config.KeyFile)
+		if err != nil {
+			return
+		}
+
+		tlsConfig = &tls.Config{
+			Certificates:       []tls.Certificate{cert},
+			InsecureSkipVerify: config.InsecureSkip,
+		}
+	}
+
+	// Create client with the same authentication settings
+	rdb := redis.NewClient(&redis.Options{
+		Addr:      redisAddr,
+		Username:  "state_manager",
+		Password:  "1Pi1Jxuno3roqjuLsfEKo",
+		TLSConfig: tlsConfig,
+	})
+
+	if err := rdb.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: lst.stream,
+		Values: map[string]any{
+			"resource_group": "core",
+			"kind":           "Widget",
+			"namespace":      "default",
+			"name":           "demo",
+			"type":           "update",
+		},
+	}).Err(); err != nil {
+		t.Fatalf("XAdd failed: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler was not called in time")
 	}
 }

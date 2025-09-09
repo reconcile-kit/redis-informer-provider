@@ -2,25 +2,75 @@ package provider
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
-	"github.com/redis/go-redis/v9"
 	"strings"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"github.com/reconcile-kit/api/resource"
 )
 
+// RedisConfig contains configuration for connecting to Redis
+type RedisConfig struct {
+	Addr         string        // Redis server address (e.g., "localhost:6379")
+	Username     string        // Username for authentication
+	Password     string        // Password for authentication
+	CertFile     string        // Path to client certificate file
+	KeyFile      string        // Path to client private key file
+	InsecureSkip bool          // Skip server certificate verification
+	DialTimeout  time.Duration // Connection timeout
+}
+
 type RedisStreamListener struct {
 	rdb             *redis.Client
 	group, consumer string
-	block           time.Duration // timeout XREADGROUP
-	resendInterval  time.Duration // как часто проверять pending
-	minIdle         time.Duration // «просрочка» для повторной доставки
+	block           time.Duration // XREADGROUP timeout
+	resendInterval  time.Duration // how often to check pending messages
+	minIdle         time.Duration // idle time before redelivery
 	stream          string
 }
 
+// NewRedisStreamListener creates a new Redis Stream listener with basic configuration
 func NewRedisStreamListener(addr, shardID string) (*RedisStreamListener, error) {
-	rdb := redis.NewClient(&redis.Options{Addr: addr, DialTimeout: 30 * time.Second})
+	config := &RedisConfig{
+		Addr:        addr,
+		DialTimeout: 30 * time.Second,
+	}
+	return NewRedisStreamListenerWithConfig(config, shardID)
+}
+
+// NewRedisStreamListenerWithConfig creates a new Redis Stream listener with full configuration
+func NewRedisStreamListenerWithConfig(config *RedisConfig, shardID string) (*RedisStreamListener, error) {
+	if err := validateConfig(config); err != nil {
+		return nil, err
+	}
+
+	// Configure TLS if certificates are specified
+	var tlsConfig *tls.Config
+	if config.CertFile != "" && config.KeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(config.CertFile, config.KeyFile)
+		if err != nil {
+			return nil, err
+		}
+
+		tlsConfig = &tls.Config{
+			Certificates:       []tls.Certificate{cert},
+			InsecureSkipVerify: config.InsecureSkip,
+		}
+
+	}
+
+	// Create Redis client with configuration
+	rdb := redis.NewClient(&redis.Options{
+		Addr:        config.Addr,
+		Username:    config.Username,
+		Password:    config.Password,
+		TLSConfig:   tlsConfig,
+		DialTimeout: config.DialTimeout,
+	})
+
 	ctx := context.Background()
 	stream := shardID + "_stream"
 	listener := &RedisStreamListener{
@@ -42,10 +92,10 @@ func NewRedisStreamListener(addr, shardID string) (*RedisStreamListener, error) 
 
 func (l *RedisStreamListener) Listen(
 	handler func(ctx context.Context,
-		kind resource.GroupKind,
-		key resource.ObjectKey,
-		msgType string,
-		ack func()),
+	kind resource.GroupKind,
+	key resource.ObjectKey,
+	msgType string,
+	ack func()),
 ) {
 	ctx := context.Background()
 	go l.resendLoop(ctx, l.stream, handler)
@@ -94,7 +144,7 @@ func (l *RedisStreamListener) resendLoop(
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			// 1. получаем список «старых» pending-сообщений
+			// 1. get list of "old" pending messages
 			pending, err := l.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
 				Stream: stream,
 				Group:  l.group,
@@ -156,5 +206,28 @@ func (l *RedisStreamListener) ensureGroup(ctx context.Context, stream string) er
 		!strings.HasPrefix(err.Error(), "BUSYGROUP") {
 		return err
 	}
+	return nil
+}
+
+// validateConfig validates Redis configuration
+func validateConfig(config *RedisConfig) error {
+	if config == nil {
+		return errors.New("configuration cannot be nil")
+	}
+
+	if config.Addr == "" {
+		return errors.New("redis server address is required")
+	}
+
+	if config.DialTimeout <= 0 {
+		config.DialTimeout = 30 * time.Second
+	}
+
+	// Check that if one certificate is specified, both are specified
+	if (config.CertFile != "" && config.KeyFile == "") ||
+		(config.CertFile == "" && config.KeyFile != "") {
+		return errors.New("both certFile and keyFile must be specified for TLS")
+	}
+
 	return nil
 }
