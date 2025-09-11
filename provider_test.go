@@ -103,8 +103,6 @@ func TestRedisStreamListenerWithAuth(t *testing.T) {
 		Addr:        redisAddr,
 		Username:    "default",
 		Password:    "password",
-		CertFile:    "/Users/new/redis_certs/cert.pem",
-		KeyFile:     "/Users/new/redis_certs/key",
 		DialTimeout: 30 * time.Second,
 	}
 
@@ -145,24 +143,17 @@ func TestRedisStreamListenerWithAuth(t *testing.T) {
 		})
 	}()
 
+	// Configure TLS if certificates are specified
 	var tlsConfig *tls.Config
-	if config.CertFile != "" && config.KeyFile != "" {
-		cert, err := tls.LoadX509KeyPair(config.CertFile, config.KeyFile)
-		if err != nil {
-			return
-		}
-
-		tlsConfig = &tls.Config{
-			Certificates:       []tls.Certificate{cert},
-			InsecureSkipVerify: config.InsecureSkip,
-		}
+	if config.EnableTLS {
+		tlsConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 
 	// Create client with the same authentication settings
 	rdb := redis.NewClient(&redis.Options{
 		Addr:      redisAddr,
 		Username:  "state_manager",
-		Password:  "1Pi1Jxuno3roqjuLsfEKo",
+		Password:  "1111",
 		TLSConfig: tlsConfig,
 	})
 

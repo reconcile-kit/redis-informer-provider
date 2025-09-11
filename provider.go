@@ -14,13 +14,11 @@ import (
 
 // RedisConfig contains configuration for connecting to Redis
 type RedisConfig struct {
-	Addr         string        // Redis server address (e.g., "localhost:6379")
-	Username     string        // Username for authentication
-	Password     string        // Password for authentication
-	CertFile     string        // Path to client certificate file
-	KeyFile      string        // Path to client private key file
-	InsecureSkip bool          // Skip server certificate verification
-	DialTimeout  time.Duration // Connection timeout
+	Addr        string        // Redis server address (e.g., "localhost:6379")
+	Username    string        // Username for authentication
+	Password    string        // Password for authentication
+	EnableTLS   bool          // Enable system tls certs
+	DialTimeout time.Duration // Connection timeout
 }
 
 type RedisStreamListener struct {
@@ -49,17 +47,8 @@ func NewRedisStreamListenerWithConfig(config *RedisConfig, shardID string) (*Red
 
 	// Configure TLS if certificates are specified
 	var tlsConfig *tls.Config
-	if config.CertFile != "" && config.KeyFile != "" {
-		cert, err := tls.LoadX509KeyPair(config.CertFile, config.KeyFile)
-		if err != nil {
-			return nil, err
-		}
-
-		tlsConfig = &tls.Config{
-			Certificates:       []tls.Certificate{cert},
-			InsecureSkipVerify: config.InsecureSkip,
-		}
-
+	if config.EnableTLS {
+		tlsConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 
 	// Create Redis client with configuration
@@ -221,12 +210,6 @@ func validateConfig(config *RedisConfig) error {
 
 	if config.DialTimeout <= 0 {
 		config.DialTimeout = 30 * time.Second
-	}
-
-	// Check that if one certificate is specified, both are specified
-	if (config.CertFile != "" && config.KeyFile == "") ||
-		(config.CertFile == "" && config.KeyFile != "") {
-		return errors.New("both certFile and keyFile must be specified for TLS")
 	}
 
 	return nil
