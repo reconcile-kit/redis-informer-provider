@@ -28,6 +28,7 @@ type RedisStreamListener struct {
 	resendInterval  time.Duration // how often to check pending messages
 	minIdle         time.Duration // idle time before redelivery
 	stream          string
+	logger          Logger
 }
 
 // NewRedisStreamListener creates a new Redis Stream listener with basic configuration
@@ -40,9 +41,41 @@ func NewRedisStreamListener(addr, shardID string) (*RedisStreamListener, error) 
 }
 
 // NewRedisStreamListenerWithConfig creates a new Redis Stream listener with full configuration
-func NewRedisStreamListenerWithConfig(config *RedisConfig, shardID string) (*RedisStreamListener, error) {
+func NewRedisStreamListenerWithConfig(config *RedisConfig, shardID string, options ...Option) (*RedisStreamListener, error) {
+	currentOptions := &opts{}
+	for _, opt := range options {
+		opt(currentOptions)
+	}
 	if err := validateConfig(config); err != nil {
 		return nil, err
+	}
+
+	var logger Logger
+	if currentOptions.logger != nil {
+		logger = currentOptions.logger
+	} else {
+		logger = &SimpleLogger{}
+	}
+
+	var listenerBlock time.Duration
+	if currentOptions.listenerBlock != 0 {
+		listenerBlock = currentOptions.listenerBlock
+	} else {
+		listenerBlock = 0
+	}
+
+	var listenerMinIdle time.Duration
+	if currentOptions.listenerMinIdle != 0 {
+		listenerMinIdle = currentOptions.listenerMinIdle
+	} else {
+		listenerMinIdle = 60 * time.Second
+	}
+
+	var resendInterval time.Duration
+	if currentOptions.resendInterval != 0 {
+		resendInterval = currentOptions.resendInterval
+	} else {
+		resendInterval = 3600 * time.Second
 	}
 
 	// Configure TLS if certificates are specified
@@ -66,10 +99,11 @@ func NewRedisStreamListenerWithConfig(config *RedisConfig, shardID string) (*Red
 		rdb:            rdb,
 		group:          shardID + "_group",
 		consumer:       shardID + "_consumer",
-		block:          5 * time.Second,
-		resendInterval: 60 * time.Second,
-		minIdle:        50 * time.Second,
+		block:          listenerBlock,
+		resendInterval: resendInterval,
+		minIdle:        listenerMinIdle,
 		stream:         stream,
+		logger:         logger,
 	}
 
 	if err := listener.ensureGroup(ctx, stream); err != nil {
@@ -101,7 +135,8 @@ func (l *RedisStreamListener) Listen(
 			continue
 		}
 		if err != nil {
-			time.Sleep(time.Second)
+			l.logger.Error("redis failed to read from stream: ", err.Error())
+			time.Sleep(3 * time.Second)
 			continue
 		}
 
@@ -133,7 +168,6 @@ func (l *RedisStreamListener) resendLoop(
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			// 1. get list of "old" pending messages
 			pending, err := l.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
 				Stream: stream,
 				Group:  l.group,
@@ -143,6 +177,9 @@ func (l *RedisStreamListener) resendLoop(
 				Idle:   l.minIdle,
 			}).Result()
 			if err != nil || len(pending) == 0 {
+				if err != nil {
+					l.logger.Error("redis failed to get pending messages: ", err.Error())
+				}
 				continue
 			}
 
@@ -150,7 +187,7 @@ func (l *RedisStreamListener) resendLoop(
 			for i, p := range pending {
 				ids[i] = p.ID
 			}
-			msgs, err := l.rdb.XClaim(ctx, &redis.XClaimArgs{
+			messages, err := l.rdb.XClaim(ctx, &redis.XClaimArgs{
 				Stream:   stream,
 				Group:    l.group,
 				Consumer: l.consumer,
@@ -158,9 +195,10 @@ func (l *RedisStreamListener) resendLoop(
 				Messages: ids,
 			}).Result()
 			if err != nil {
+				l.logger.Error("redis failed to claim messages: ", err.Error())
 				continue
 			}
-			l.handleBatch(ctx, stream, msgs, handler)
+			l.handleBatch(ctx, stream, messages, handler)
 		}
 	}
 }
@@ -184,7 +222,14 @@ func (l *RedisStreamListener) handleBatch(
 		evType := m.Values["type"].(string)
 
 		ack := func() {
-			_ = l.rdb.XAck(ctx, stream, l.group, m.ID).Err()
+			_, err := l.rdb.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.XAck(ctx, stream, l.group, m.ID)
+				pipe.XDel(ctx, stream, m.ID)
+				return nil
+			})
+			if err != nil {
+				l.logger.Error("redis failed to XAck and XDel message: ", err.Error())
+			}
 		}
 		handler(ctx, kind, key, evType, ack)
 	}
