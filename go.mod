@@ -3,7 +3,7 @@ module github.com/reconcile-kit/redis-informer-provider
 go 1.24.2
 
 require (
-	github.com/reconcile-kit/api v0.0.7
+	github.com/reconcile-kit/api v0.0.16
 	github.com/redis/go-redis/v9 v9.8.0
 )
 
